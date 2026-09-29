@@ -475,7 +475,6 @@ impl Factory {
         token_wasm_hash: Option<BytesN<32>>,
     ) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
         if let Some(ref h) = amm_wasm_hash {
@@ -499,7 +498,6 @@ impl Factory {
     /// will use the new default tier.
     pub fn set_default_fee_tier(env: Env, fee_tier: i128) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
@@ -523,7 +521,6 @@ impl Factory {
     /// State is preserved; only bytecode is replaced.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.deployer()
@@ -539,7 +536,6 @@ impl Factory {
     /// Set or update the WASM hash used for concentrated_liquidity deployments. Admin-only.
     pub fn set_cl_wasm_hash(env: Env, cl_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
@@ -721,7 +717,6 @@ impl Factory {
     /// before enabling permissionless mode.
     pub fn set_permissionless_mode(env: Env, enabled: bool) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
@@ -746,7 +741,6 @@ impl Factory {
         fee_amount: i128,
     ) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
         if fee_amount <= 0 {
@@ -770,7 +764,6 @@ impl Factory {
     /// burst creation attempts. Set to 0 to disable rate limiting.
     pub fn set_rate_limit(env: Env, min_ledgers: u32) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
@@ -1054,11 +1047,6 @@ impl Factory {
         global_protocol_fee_bps: i128,
     ) -> Result<(), FactoryError> {
         Self::extend_ttl(&env);
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            return Err(FactoryError::Unauthorized);
-        }
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
         if !(0..=10_000).contains(&global_protocol_fee_bps) {
             return Err(FactoryError::InvalidFeeBps);
@@ -1120,11 +1108,6 @@ impl Factory {
         protocol_fee_bps: i128,
     ) -> Result<u32, FactoryError> {
         Self::extend_ttl(&env);
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            return Err(FactoryError::Unauthorized);
-        }
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
         if !env.storage().instance().has(&DataKey::Treasury) {
             return Err(FactoryError::FeeNotConfigured);
@@ -1154,11 +1137,6 @@ impl Factory {
         limit: u32,
     ) -> Result<u32, FactoryError> {
         Self::extend_ttl(&env);
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            return Err(FactoryError::Unauthorized);
-        }
-        admin.require_auth();
         Self::require_admin(&env, &admin)?;
         if !env.storage().instance().has(&DataKey::Treasury) {
             return Err(FactoryError::FeeNotConfigured);
