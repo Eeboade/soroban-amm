@@ -720,7 +720,7 @@ mod tests {
     use super::*;
     use amm::{AmmPool, AmmPoolClient};
     use soroban_sdk::{
-        testutils::{storage::Instance as _, Address as _, Events as _, Ledger},
+        testutils::{Address as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Address, Env,
     };

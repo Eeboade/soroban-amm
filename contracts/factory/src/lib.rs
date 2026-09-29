@@ -21,7 +21,7 @@ use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token as sdk_token,
     Address, BytesN, Env, Symbol, Vec,
 };
-use pool_interfaces::{ClPoolClient, PoolState};
+use pool_interfaces::ClPoolClient;
 
 // ── Typed errors ─────────────────────────────────────────────────────────────
 
