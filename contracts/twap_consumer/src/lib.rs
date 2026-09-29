@@ -43,18 +43,25 @@ pub enum TwapError {
 #[contracttype]
 pub enum DataKey {
     Keeper,
-    Snapshot(Address, u64),
     /// Legacy tracked-pool list: a bare `Vec<Address>` with no pool type,
     /// written by contract versions before #964. Read only as a fallback when
     /// `TrackedPools` is absent; every entry is interpreted as `PoolType::Amm`,
     /// which is how `get_twap_all` read them. Removed on the first write of
     /// the typed list.
     TrackedPoolsPersistent,
-    /// Sorted (ascending, deduplicated) ledger timestamps at which a snapshot
-    /// was saved for this pool. Lets `get_twap_*` binary-search for the most
-    /// recent snapshot at or before an arbitrary `then_ts` instead of
-    /// requiring an exact-timestamp hit (issue #469).
-    SnapshotTimestamps(Address),
+    /// Every retained snapshot for a pool, in one entry, sorted by ascending
+    /// (deduplicated) ledger timestamp. Readers binary-search it for the most
+    /// recent snapshot at or before an arbitrary `then_ts` (issue #469).
+    ///
+    /// Keyed by pool only (issue #985). Snapshots used to live under
+    /// `Snapshot(pool, ledger_timestamp)`, but a Soroban transaction's
+    /// footprint is fixed at simulation, against an earlier ledger with an
+    /// earlier timestamp, so on a real network every save wrote a key outside
+    /// its footprint and trapped. Reads had the same flaw: the snapshot they
+    /// loaded was chosen by the current timestamp. No storage key in this
+    /// contract may depend on the ledger timestamp or sequence;
+    /// `scripts/check_storage_keys.sh` enforces that in CI.
+    Snapshots(Address),
     RetentionPolicy,
     /// Typed tracked-pool list (`Vec<TrackedPool>`), replacing the untyped
     /// `TrackedPoolsPersistent` (#964).
@@ -92,6 +99,13 @@ pub struct TwapEntry {
     pub pool_type: PoolType,
     pub twap: i128,
 }
+
+/// One retained snapshot as stored under [`DataKey::Snapshots`]:
+/// `(ledger_ts, cum_a, cum_b, pool_ts)`. A tuple rather than
+/// [`PriceSnapshot`] because it encodes at roughly half the size, which is
+/// what lets [`TwapConsumer::MAX_SNAPSHOTS_PER_POOL`] snapshots fit in a
+/// single ledger entry.
+type SnapshotEntry = (u64, i128, i128, u64);
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,7 +201,8 @@ impl TwapConsumer {
     }
 
     /// Sets the snapshot retention policy. Caller must be the keeper/admin.
-    /// Rejects policies with `0 < max_age_seconds < LONGEST_TWAP_WINDOW`.
+    /// Rejects policies with `0 < max_age_seconds < LONGEST_TWAP_WINDOW` or
+    /// `max_snapshots_per_pool > MAX_SNAPSHOTS_PER_POOL`.
     pub fn set_retention_policy(
         env: Env,
         admin: Address,
@@ -201,6 +216,9 @@ impl TwapConsumer {
         admin.require_auth();
 
         if policy.max_age_seconds > 0 && policy.max_age_seconds < Self::LONGEST_TWAP_WINDOW {
+            return Err(TwapError::InvalidRetentionPolicy);
+        }
+        if policy.max_snapshots_per_pool > Self::MAX_SNAPSHOTS_PER_POOL {
             return Err(TwapError::InvalidRetentionPolicy);
         }
 
@@ -223,33 +241,24 @@ impl TwapConsumer {
             })
     }
 
-    /// Returns the number of snapshots tracked in the index for `pool`.
+    /// Returns the number of snapshots retained for `pool`.
     pub fn get_snapshot_count(env: Env, pool: Address) -> u32 {
         Self::extend_instance_ttl(&env);
-        let timestamps: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SnapshotTimestamps(pool))
-            .unwrap_or_else(|| Vec::new(&env));
-        timestamps.len()
+        Self::load_snapshots(&env, &pool).len()
     }
 
     /// Returns a paginated slice of snapshot timestamps for `pool`.
     pub fn list_snapshot_timestamps(env: Env, pool: Address, offset: u32, limit: u32) -> Vec<u64> {
         Self::extend_instance_ttl(&env);
-        let timestamps: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SnapshotTimestamps(pool))
-            .unwrap_or_else(|| Vec::new(&env));
-        let len = timestamps.len();
+        let snapshots = Self::load_snapshots(&env, &pool);
+        let len = snapshots.len();
         let mut result = Vec::new(&env);
         if offset >= len || limit == 0 {
             return result;
         }
-        let end = (offset + limit).min(len);
+        let end = offset.saturating_add(limit).min(len);
         for i in offset..end {
-            result.push_back(timestamps.get(i).unwrap());
+            result.push_back(snapshots.get(i).unwrap().0);
         }
         result
     }
@@ -263,26 +272,15 @@ impl TwapConsumer {
         limit: u32,
     ) -> Vec<(u64, PriceSnapshot)> {
         Self::extend_instance_ttl(&env);
-        let timestamps: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SnapshotTimestamps(pool.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
+        let snapshots = Self::load_snapshots(&env, &pool);
         let mut result = Vec::new(&env);
         let max_items = if limit == 0 { u32::MAX } else { limit };
-        for i in 0..timestamps.len() {
+        for entry in snapshots.iter() {
             if result.len() >= max_items {
                 break;
             }
-            let ts = timestamps.get(i).unwrap();
-            if ts >= from_ts && ts <= to_ts {
-                if let Some(snap) = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::Snapshot(pool.clone(), ts))
-                {
-                    result.push_back((ts, snap));
-                }
+            if entry.0 >= from_ts && entry.0 <= to_ts {
+                result.push_back((entry.0, Self::to_price_snapshot(&entry)));
             }
         }
         result
@@ -292,24 +290,7 @@ impl TwapConsumer {
         Self::extend_instance_ttl(&env);
         Self::require_keeper(&env)?;
         let (cum_a, cum_b, pool_ts) = Self::amm_price_cumulative(&env, &pool)?;
-        let ledger_ts = env.ledger().timestamp();
-        let snapshot = PriceSnapshot {
-            cum_a,
-            cum_b,
-            pool_ts,
-        };
-        let key = DataKey::Snapshot(pool.clone(), ledger_ts);
-        env.storage().persistent().set(&key, &snapshot);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::SNAPSHOT_TTL_LEDGERS / 2,
-            Self::SNAPSHOT_TTL_LEDGERS,
-        );
-        Self::record_snapshot_timestamp(&env, &pool, ledger_ts);
-        Self::register_tracked_pool(&env, &pool, PoolType::Amm);
-
-        // Opportunistic bounded amortised pruning
-        let _ = Self::prune_snapshots_internal(&env, &pool, Self::AMORTIZED_PRUNE_LIMIT);
+        Self::record_snapshot(&env, &pool, PoolType::Amm, cum_a, cum_b, pool_ts);
         Ok(())
     }
 
@@ -318,12 +299,13 @@ impl TwapConsumer {
     pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) -> Result<(), TwapError> {
         Self::extend_instance_ttl(&env);
         Self::require_keeper(&env)?;
-        let key = DataKey::Snapshot(pool.clone(), ledger_ts);
-        if !env.storage().persistent().has(&key) {
-            return Err(TwapError::NoSnapshotFound);
-        }
-        env.storage().persistent().remove(&key);
-        Self::remove_snapshot_timestamp(&env, &pool, ledger_ts);
+        let mut snapshots = Self::load_snapshots(&env, &pool);
+        let index = snapshots
+            .iter()
+            .position(|entry| entry.0 == ledger_ts)
+            .ok_or(TwapError::NoSnapshotFound)?;
+        snapshots.remove(index as u32);
+        Self::store_snapshots(&env, &pool, &snapshots);
         soroban_amm_sdk::emit_versioned_event!(
             &env,
             (symbol_short!("snap_del"), pool),
@@ -332,83 +314,68 @@ impl TwapConsumer {
         Ok(())
     }
 
-    /// Internal helper that implements bounded pruning for a single pool.
-    fn prune_snapshots_internal(env: &Env, pool: &Address, max_to_remove: u32) -> u32 {
-        if max_to_remove == 0 {
-            return 0;
-        }
-        let policy = Self::get_retention_policy(env.clone());
-        let current_ts = env.ledger().timestamp();
-        let key = DataKey::SnapshotTimestamps(pool.clone());
-        let timestamps: Vec<u64> = env
-            .storage()
+    /// Hard ceiling on snapshots retained per pool, whatever the retention
+    /// policy says. All of a pool's snapshots share one ledger entry, and
+    /// ledger entries are size-limited (64 KiB on public networks); at about
+    /// 76 bytes per snapshot this keeps a full entry near 39 KiB. It still
+    /// covers [`Self::LONGEST_TWAP_WINDOW`] for a keeper saving as often as
+    /// every 3 minutes. Once reached, each save drops the oldest snapshot.
+    pub const MAX_SNAPSHOTS_PER_POOL: u32 = 512;
+
+    fn load_snapshots(env: &Env, pool: &Address) -> Vec<SnapshotEntry> {
+        env.storage()
             .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        let total_count = timestamps.len();
-        if total_count == 0 {
-            return 0;
-        }
-
-        let mut remove_count = 0u32;
-        let mut remaining_timestamps = Vec::new(env);
-
-        for i in 0..total_count {
-            let ts = timestamps.get(i).unwrap();
-            let remaining_count = total_count - remove_count;
-
-            let age_eligible = policy.max_age_seconds > 0
-                && current_ts >= ts.saturating_add(policy.max_age_seconds);
-            let count_eligible = policy.max_snapshots_per_pool > 0
-                && remaining_count > policy.max_snapshots_per_pool;
-
-            if (age_eligible || count_eligible) && remove_count < max_to_remove {
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::Snapshot(pool.clone(), ts));
-                remove_count += 1;
-            } else {
-                remaining_timestamps.push_back(ts);
-            }
-        }
-
-        if remove_count > 0 {
-            env.storage().persistent().set(&key, &remaining_timestamps);
-            env.storage().persistent().extend_ttl(
-                &key,
-                Self::SNAPSHOT_TTL_LEDGERS / 2,
-                Self::SNAPSHOT_TTL_LEDGERS,
-            );
-            let oldest_remaining_ts = remaining_timestamps.first().unwrap_or(0);
-            soroban_amm_sdk::emit_versioned_event!(
-                env,
-                (symbol_short!("pruned"), pool.clone()),
-                (remove_count, oldest_remaining_ts)
-            );
-        }
-
-        remove_count
+            .get(&DataKey::Snapshots(pool.clone()))
+            .unwrap_or_else(|| Vec::new(env))
     }
 
-    /// Permissionless bounded pruning for a pool according to the active retention policy.
-    pub fn prune_snapshots(env: Env, pool: Address, max_to_remove: u32) -> u32 {
-        Self::extend_instance_ttl(&env);
-        Self::prune_snapshots_internal(&env, &pool, max_to_remove)
+    fn store_snapshots(env: &Env, pool: &Address, snapshots: &Vec<SnapshotEntry>) {
+        let key = DataKey::Snapshots(pool.clone());
+        env.storage().persistent().set(&key, snapshots);
+        env.storage().persistent().extend_ttl(
+            &key,
+            Self::SNAPSHOT_TTL_LEDGERS / 2,
+            Self::SNAPSHOT_TTL_LEDGERS,
+        );
     }
 
-    /// Permissionless sweep across all tracked pools, removing up to `max_to_remove_per_pool`
-    /// eligible snapshots per pool. Fault-isolated so one pool cannot abort the sweep.
-    pub fn prune_all(env: Env, max_to_remove_per_pool: u32) -> u32 {
-        let tracked = Self::load_tracked(&env);
-        Self::extend_instance_ttl(&env);
-        let tracked: Vec<Address> = Self::get_tracked_pools(env.clone());
-        let mut total_removed = 0u32;
-        for i in 0..tracked.len() {
-            let pool = tracked.get(i).unwrap().address;
-            let removed = Self::prune_snapshots_internal(&env, &pool, max_to_remove_per_pool);
-            total_removed = total_removed.saturating_add(removed);
+    fn to_price_snapshot(entry: &SnapshotEntry) -> PriceSnapshot {
+        PriceSnapshot {
+            cum_a: entry.1,
+            cum_b: entry.2,
+            pool_ts: entry.3,
         }
-        total_removed
+    }
+
+    /// Shared body of `save_snapshot` / `save_cl_snapshot`: record the
+    /// snapshot at the current ledger time, prune, and register the pool.
+    ///
+    /// Every key touched here is fixed given `pool`, so the footprint a
+    /// client simulates is the footprint the transaction applies with, even
+    /// though the ledger timestamp moves on in between (issue #985).
+    fn record_snapshot(
+        env: &Env,
+        pool: &Address,
+        pool_type: PoolType,
+        cum_a: i128,
+        cum_b: i128,
+        pool_ts: u64,
+    ) {
+        let ledger_ts = env.ledger().timestamp();
+        let entry: SnapshotEntry = (ledger_ts, cum_a, cum_b, pool_ts);
+        let mut snapshots = Self::load_snapshots(env, pool);
+        // Ledger timestamps never decrease, so appending keeps the list
+        // sorted. A second save within the same ledger replaces the first.
+        match snapshots.last() {
+            Some(last) if last.0 == ledger_ts => snapshots.set(snapshots.len() - 1, entry),
+            _ => snapshots.push_back(entry),
+        }
+        // Opportunistic bounded amortised pruning. Each save adds at most one
+        // snapshot and this removes up to two, so the count cap always holds.
+        Self::prune_list(env, pool, &mut snapshots, Self::AMORTIZED_PRUNE_LIMIT);
+        Self::store_snapshots(env, pool, &snapshots);
+
+        Self::register_tracked_pool(env, pool, pool_type);
     }
 
     /// Reads the tracked-pool set, falling back to the legacy untyped list.
@@ -499,59 +466,94 @@ impl TwapConsumer {
         }
     }
 
-    /// Record `ts` in the pool's sorted snapshot-timestamp index. Ledger
-    /// timestamps are non-decreasing across calls, so appending keeps the
-    /// index sorted; skip if `ts` is already the most recent entry so a
-    /// keeper re-saving within the same ledger doesn't create a duplicate.
-    fn record_snapshot_timestamp(env: &Env, pool: &Address, ts: u64) {
-        let key = DataKey::SnapshotTimestamps(pool.clone());
-        let mut timestamps: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        if timestamps.last() != Some(ts) {
-            timestamps.push_back(ts);
+    /// Removes up to `max_to_remove` snapshots from `snapshots` that the
+    /// retention policy (or [`Self::MAX_SNAPSHOTS_PER_POOL`]) makes eligible,
+    /// oldest first, emitting a `pruned` event if any were removed. Storing
+    /// the list is left to the caller.
+    fn prune_list(
+        env: &Env,
+        pool: &Address,
+        snapshots: &mut Vec<SnapshotEntry>,
+        max_to_remove: u32,
+    ) -> u32 {
+        let total_count = snapshots.len();
+        if max_to_remove == 0 || total_count == 0 {
+            return 0;
         }
-        env.storage().persistent().set(&key, &timestamps);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::SNAPSHOT_TTL_LEDGERS / 2,
-            Self::SNAPSHOT_TTL_LEDGERS,
-        );
-    }
+        let policy = Self::get_retention_policy(env.clone());
+        let max_count = if policy.max_snapshots_per_pool > 0 {
+            policy
+                .max_snapshots_per_pool
+                .min(Self::MAX_SNAPSHOTS_PER_POOL)
+        } else {
+            Self::MAX_SNAPSHOTS_PER_POOL
+        };
+        let current_ts = env.ledger().timestamp();
 
-    fn remove_snapshot_timestamp(env: &Env, pool: &Address, ts: u64) {
-        let key = DataKey::SnapshotTimestamps(pool.clone());
-        let timestamps: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        let mut updated: Vec<u64> = Vec::new(env);
-        for i in 0..timestamps.len() {
-            let t = timestamps.get(i).unwrap();
-            if t != ts {
-                updated.push_back(t);
+        let mut remove_count = 0u32;
+        let mut remaining = Vec::new(env);
+        for entry in snapshots.iter() {
+            let ts = entry.0;
+            let remaining_count = total_count - remove_count;
+
+            let age_eligible = policy.max_age_seconds > 0
+                && current_ts >= ts.saturating_add(policy.max_age_seconds);
+            let count_eligible = remaining_count > max_count;
+
+            if (age_eligible || count_eligible) && remove_count < max_to_remove {
+                remove_count += 1;
+            } else {
+                remaining.push_back(entry);
             }
         }
-        env.storage().persistent().set(&key, &updated);
+
+        if remove_count > 0 {
+            *snapshots = remaining;
+            let oldest_remaining_ts = snapshots.first().map(|entry| entry.0).unwrap_or(0);
+            soroban_amm_sdk::emit_versioned_event!(
+                env,
+                (symbol_short!("pruned"), pool.clone()),
+                (remove_count, oldest_remaining_ts)
+            );
+        }
+        remove_count
     }
 
-    /// Binary-search the pool's snapshot-timestamp index for the most recent
-    /// entry at or before `then_ts` (the "floor"). Returns `None` if no
-    /// snapshot that old exists.
-    fn floor_snapshot_ts(env: &Env, pool: &Address, then_ts: u64) -> Option<u64> {
-        let timestamps: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SnapshotTimestamps(pool.clone()))
-            .unwrap_or_else(|| Vec::new(env));
+    /// Permissionless bounded pruning for a pool according to the active retention policy.
+    pub fn prune_snapshots(env: Env, pool: Address, max_to_remove: u32) -> u32 {
+        Self::extend_instance_ttl(&env);
+        let mut snapshots = Self::load_snapshots(&env, &pool);
+        let removed = Self::prune_list(&env, &pool, &mut snapshots, max_to_remove);
+        if removed > 0 {
+            Self::store_snapshots(&env, &pool, &snapshots);
+        }
+        removed
+    }
+
+    /// Permissionless sweep across all tracked pools, removing up to `max_to_remove_per_pool`
+    /// eligible snapshots per pool. Fault-isolated so one pool cannot abort the sweep.
+    pub fn prune_all(env: Env, max_to_remove_per_pool: u32) -> u32 {
+        Self::extend_instance_ttl(&env);
+        let tracked: Vec<Address> = Self::get_tracked_pools(env.clone());
+        let mut total_removed = 0u32;
+        for i in 0..tracked.len() {
+            let pool = tracked.get(i).unwrap();
+            let removed = Self::prune_snapshots(env.clone(), pool, max_to_remove_per_pool);
+            total_removed = total_removed.saturating_add(removed);
+        }
+        total_removed
+    }
+
+    /// Binary-search the pool's snapshots for the most recent one at or
+    /// before `then_ts` (the "floor"). Returns `None` if no snapshot that old
+    /// exists.
+    fn floor_snapshot(env: &Env, pool: &Address, then_ts: u64) -> Option<PriceSnapshot> {
+        let snapshots = Self::load_snapshots(env, pool);
         let mut lo: u32 = 0;
-        let mut hi: u32 = timestamps.len();
+        let mut hi: u32 = snapshots.len();
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if timestamps.get(mid).unwrap() <= then_ts {
+            if snapshots.get(mid).unwrap().0 <= then_ts {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -560,7 +562,7 @@ impl TwapConsumer {
         if lo == 0 {
             None
         } else {
-            Some(timestamps.get(lo - 1).unwrap())
+            Some(Self::to_price_snapshot(&snapshots.get(lo - 1).unwrap()))
         }
     }
 
@@ -575,13 +577,8 @@ impl TwapConsumer {
             return Err(TwapError::InsufficientHistory);
         }
         let then_ts = ledger_ts_now - window_seconds;
-        let floor_ts =
-            Self::floor_snapshot_ts(&env, &pool, then_ts).ok_or(TwapError::InsufficientHistory)?;
-        let snapshot: PriceSnapshot = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Snapshot(pool.clone(), floor_ts))
-            .ok_or(TwapError::NoSnapshotFound)?;
+        let snapshot =
+            Self::floor_snapshot(&env, &pool, then_ts).ok_or(TwapError::InsufficientHistory)?;
 
         let delta_a = (cum_a_now as u128).wrapping_sub(snapshot.cum_a as u128) as i128;
         let elapsed = (pool_ts_now - snapshot.pool_ts) as i128;
@@ -672,13 +669,8 @@ impl TwapConsumer {
             return Err(TwapError::InsufficientHistory);
         }
         let then_ts = ledger_ts_now - window_seconds;
-        let floor_ts =
-            Self::floor_snapshot_ts(&env, &pool, then_ts).ok_or(TwapError::InsufficientHistory)?;
-        let snapshot: PriceSnapshot = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Snapshot(pool.clone(), floor_ts))
-            .ok_or(TwapError::NoSnapshotFound)?;
+        let snapshot =
+            Self::floor_snapshot(&env, &pool, then_ts).ok_or(TwapError::InsufficientHistory)?;
 
         let delta_a = (cum_a_now as u128).wrapping_sub(snapshot.cum_a as u128) as i128;
         let delta_b = (cum_b_now as u128).wrapping_sub(snapshot.cum_b as u128) as i128;
@@ -692,6 +684,7 @@ impl TwapConsumer {
     /// Addresses of every tracked pool, of either type. See
     /// `get_tracked_pools_typed` for each pool's type.
     pub fn get_tracked_pools(env: Env) -> Vec<Address> {
+        Self::extend_instance_ttl(&env);
         let tracked = Self::load_tracked(&env);
         let mut out = Vec::new(&env);
         for entry in tracked.iter() {
@@ -702,6 +695,7 @@ impl TwapConsumer {
 
     /// The tracked-pool set with each pool's type.
     pub fn get_tracked_pools_typed(env: Env) -> Vec<TrackedPool> {
+        Self::extend_instance_ttl(&env);
         Self::load_tracked(&env)
     }
 
@@ -714,6 +708,7 @@ impl TwapConsumer {
     /// A pool that does not implement the interface its type implies yields
     /// `CrossContractCallFailed` rather than a host trap (#964).
     pub fn get_twap_all(env: Env, window_seconds: u64) -> Result<Vec<TwapEntry>, TwapError> {
+        Self::extend_instance_ttl(&env);
         let tracked = Self::load_tracked(&env);
         let mut results = Vec::new(&env);
         for entry in tracked.iter() {
@@ -732,21 +727,6 @@ impl TwapConsumer {
                 pool_type: entry.pool_type,
                 twap,
             });
-        Self::extend_instance_ttl(&env);
-        env.storage()
-            .persistent()
-            .get(&DataKey::TrackedPoolsPersistent)
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    pub fn get_twap_all(env: Env, window_seconds: u64) -> Result<Vec<(Address, i128)>, TwapError> {
-        Self::extend_instance_ttl(&env);
-        let tracked: Vec<Address> = Self::get_tracked_pools(env.clone());
-        let mut results: Vec<(Address, i128)> = Vec::new(&env);
-        for i in 0..tracked.len() {
-            let pool = tracked.get(i).unwrap();
-            let twap = Self::get_twap_price(env.clone(), pool.clone(), window_seconds)?;
-            results.push_back((pool, twap));
         }
         Ok(results)
     }
@@ -762,13 +742,8 @@ impl TwapConsumer {
             return Err(TwapError::InsufficientHistory);
         }
         let then_ts = ledger_ts_now - window_seconds;
-        let floor_ts =
-            Self::floor_snapshot_ts(&env, &pool, then_ts).ok_or(TwapError::InsufficientHistory)?;
-        let snapshot: PriceSnapshot = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Snapshot(pool.clone(), floor_ts))
-            .ok_or(TwapError::NoSnapshotFound)?;
+        let snapshot =
+            Self::floor_snapshot(&env, &pool, then_ts).ok_or(TwapError::InsufficientHistory)?;
 
         let cum_then = snapshot.cum_a as i64;
         let elapsed_pool = (last_ts_now - snapshot.pool_ts) as i64;
@@ -782,24 +757,7 @@ impl TwapConsumer {
         Self::extend_instance_ttl(&env);
         Self::require_keeper(&env)?;
         let (tick_cum, pool_ts) = Self::cl_tick_cumulative(&env, &pool)?;
-        let ledger_ts = env.ledger().timestamp();
-        let snapshot = PriceSnapshot {
-            cum_a: tick_cum as i128,
-            cum_b: 0,
-            pool_ts,
-        };
-        let key = DataKey::Snapshot(pool.clone(), ledger_ts);
-        env.storage().persistent().set(&key, &snapshot);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::SNAPSHOT_TTL_LEDGERS / 2,
-            Self::SNAPSHOT_TTL_LEDGERS,
-        );
-        Self::record_snapshot_timestamp(&env, &pool, ledger_ts);
-        Self::register_tracked_pool(&env, &pool, PoolType::Cl);
-
-        // Opportunistic bounded amortised pruning
-        let _ = Self::prune_snapshots_internal(&env, &pool, Self::AMORTIZED_PRUNE_LIMIT);
+        Self::record_snapshot(&env, &pool, PoolType::Cl, tick_cum as i128, 0, pool_ts);
         Ok(())
     }
 }
@@ -856,6 +814,25 @@ mod tests {
             StellarTokenClient::new(env, &contract.address()),
             StellarAssetClient::new(env, &contract.address()),
         )
+    }
+
+    /// Writes `(ledger_ts, cum, cum, pool_ts = ledger_ts)` snapshots for each
+    /// timestamp straight into the consumer's storage, bypassing
+    /// `save_snapshot`, so pruning can be tested against arbitrary history.
+    fn seed_snapshots(env: &Env, consumer: &Address, pool: &Address, cum: i128, stamps: &[u64]) {
+        env.as_contract(consumer, || {
+            let mut snapshots: Vec<SnapshotEntry> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Snapshots(pool.clone()))
+                .unwrap_or_else(|| Vec::new(env));
+            for &ts in stamps {
+                snapshots.push_back((ts, cum, cum, ts));
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::Snapshots(pool.clone()), &snapshots);
+        });
     }
 
     /// Deploys an `AmmPool`, seeds it with `reserve_a`/`reserve_b` liquidity,
@@ -1526,20 +1503,7 @@ mod tests {
         consumer.initialize(&keeper);
 
         // Manually write snapshot to storage
-        let snapshot = PriceSnapshot {
-            cum_a: 100,
-            cum_b: 100,
-            pool_ts: ledger_ts,
-        };
-        env.as_contract(&consumer_addr, || {
-            let key = DataKey::Snapshot(pool.clone(), ledger_ts);
-            env.storage().persistent().set(&key, &snapshot);
-            let mut ts_vec = Vec::new(&env);
-            ts_vec.push_back(ledger_ts);
-            env.storage()
-                .persistent()
-                .set(&DataKey::SnapshotTimestamps(pool.clone()), &ts_vec);
-        });
+        seed_snapshots(&env, &consumer_addr, &pool, 100, &[ledger_ts]);
 
         consumer.delete_snapshot(&pool, &ledger_ts);
 
@@ -1740,27 +1704,7 @@ mod tests {
         consumer.set_retention_policy(&admin, &policy);
 
         // Helper to manually insert snapshot
-        let insert_snapshot = |ts: u64| {
-            env.as_contract(&consumer_addr, || {
-                let snap = PriceSnapshot {
-                    cum_a: 1000,
-                    cum_b: 1000,
-                    pool_ts: ts,
-                };
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Snapshot(pool.clone(), ts), &snap);
-                let mut ts_vec: Vec<u64> = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::SnapshotTimestamps(pool.clone()))
-                    .unwrap_or_else(|| Vec::new(&env));
-                ts_vec.push_back(ts);
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::SnapshotTimestamps(pool.clone()), &ts_vec);
-            });
-        };
+        let insert_snapshot = |ts: u64| seed_snapshots(&env, &consumer_addr, &pool, 1000, &[ts]);
 
         // Snapshots at timestamps: 10_000, 10_001
         insert_snapshot(10_000);
@@ -1802,23 +1746,13 @@ mod tests {
         };
         consumer.set_retention_policy(&admin, &policy);
 
-        env.as_contract(&consumer_addr, || {
-            let mut ts_vec = Vec::new(&env);
-            for ts in 1..=10u64 {
-                let snap = PriceSnapshot {
-                    cum_a: 1000,
-                    cum_b: 1000,
-                    pool_ts: ts,
-                };
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Snapshot(pool.clone(), ts), &snap);
-                ts_vec.push_back(ts);
-            }
-            env.storage()
-                .persistent()
-                .set(&DataKey::SnapshotTimestamps(pool.clone()), &ts_vec);
-        });
+        seed_snapshots(
+            &env,
+            &consumer_addr,
+            &pool,
+            1000,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        );
 
         // Advance time so all 10 are age-eligible
         env.ledger().set_timestamp(200_000);
@@ -1850,23 +1784,7 @@ mod tests {
         };
         consumer.set_retention_policy(&admin, &policy);
 
-        env.as_contract(&consumer_addr, || {
-            let mut ts_vec = Vec::new(&env);
-            for ts in 1..=6u64 {
-                let snap = PriceSnapshot {
-                    cum_a: 1000,
-                    cum_b: 1000,
-                    pool_ts: ts,
-                };
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Snapshot(pool.clone(), ts), &snap);
-                ts_vec.push_back(ts);
-            }
-            env.storage()
-                .persistent()
-                .set(&DataKey::SnapshotTimestamps(pool.clone()), &ts_vec);
-        });
+        seed_snapshots(&env, &consumer_addr, &pool, 1000, &[1, 2, 3, 4, 5, 6]);
 
         // 6 exist, max is 3 -> 3 eligible
         let removed = consumer.prune_snapshots(&pool, &10);
@@ -1906,22 +1824,9 @@ mod tests {
             env.storage()
                 .persistent()
                 .set(&DataKey::TrackedPoolsPersistent, &tracked);
-
-            let mut ts1: Vec<u64> = Vec::new(&env);
-            ts1.push_back(100);
-            ts1.push_back(200);
-            env.storage()
-                .persistent()
-                .set(&DataKey::SnapshotTimestamps(pool1.clone()), &ts1);
-
-            let mut ts2: Vec<u64> = Vec::new(&env);
-            ts2.push_back(100);
-            ts2.push_back(200);
-            ts2.push_back(300);
-            env.storage()
-                .persistent()
-                .set(&DataKey::SnapshotTimestamps(pool2.clone()), &ts2);
         });
+        seed_snapshots(&env, &consumer_addr, &pool1, 1000, &[100, 200]);
+        seed_snapshots(&env, &consumer_addr, &pool2, 1000, &[100, 200, 300]);
 
         env.ledger().set_timestamp(200_000);
 
@@ -2108,23 +2013,7 @@ mod tests {
         };
         consumer.set_retention_policy(&admin, &policy);
 
-        env.as_contract(&consumer_addr, || {
-            let mut ts_vec = Vec::new(&env);
-            for ts in [1000u64, 2000u64, 200_000u64] {
-                let snap = PriceSnapshot {
-                    cum_a: 1000,
-                    cum_b: 1000,
-                    pool_ts: ts,
-                };
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Snapshot(pool.clone(), ts), &snap);
-                ts_vec.push_back(ts);
-            }
-            env.storage()
-                .persistent()
-                .set(&DataKey::SnapshotTimestamps(pool.clone()), &ts_vec);
-        });
+        seed_snapshots(&env, &consumer_addr, &pool, 1000, &[1000, 2000, 200_000]);
 
         env.ledger().set_timestamp(250_000);
         // At 250_000: ts 1000 and 2000 are older than 100_000s; ts 200_000 is 50_000s old (remains)
@@ -2147,6 +2036,263 @@ mod tests {
         assert_eq!(version, 1);
         assert_eq!(count_val, 2);
         assert_eq!(oldest_ts_val, 200_000);
+    }
+
+    /// Every contract storage key in the ledger. A Soroban transaction may only
+    /// touch keys its simulated footprint lists, so the keys a save writes
+    /// must not change with the ledger clock (issue #985).
+    fn contract_data_keys(env: &Env) -> std::collections::BTreeSet<soroban_sdk::xdr::LedgerKey> {
+        env.to_snapshot()
+            .ledger
+            .ledger_entries
+            .into_iter()
+            .map(|(key, _)| *key)
+            // Auth nonces (from `mock_all_auths`) are not contract storage.
+            .filter(|key| {
+                matches!(key, soroban_sdk::xdr::LedgerKey::ContractData(data)
+                    if !matches!(data.key, soroban_sdk::xdr::ScVal::LedgerKeyNonce(_)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn save_snapshot_keys_do_not_depend_on_ledger_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let admin = Address::generate(&env);
+        // The fixture's first save_snapshot establishes the pool's entry.
+        let (pool, consumer) = setup_pool_and_consumer(&env, &admin, 1_000_000, 1_000_000);
+        let keys_before = contract_data_keys(&env);
+
+        // Saves at later ledger times — what apply sees after a client
+        // simulated against an earlier ledger — must write only keys that
+        // already exist, never a new one derived from the timestamp.
+        for ts in [10_005, 10_060, 99_999] {
+            env.ledger().set_timestamp(ts);
+            consumer.save_snapshot(&pool);
+            assert_eq!(
+                contract_data_keys(&env),
+                keys_before,
+                "save at ts {ts} wrote a new key"
+            );
+        }
+        assert_eq!(consumer.get_snapshot_count(&pool), 4);
+    }
+
+    #[test]
+    fn save_cl_snapshot_keys_do_not_depend_on_ledger_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(20_000);
+        let keeper = Address::generate(&env);
+        let pool = env.register_contract(None, MockClPool);
+        let consumer = TwapConsumerClient::new(&env, &env.register_contract(None, TwapConsumer));
+        consumer.initialize(&keeper);
+        consumer.save_cl_snapshot(&pool);
+        let keys_before = contract_data_keys(&env);
+
+        for ts in [20_001, 20_500] {
+            env.ledger().set_timestamp(ts);
+            consumer.save_cl_snapshot(&pool);
+            assert_eq!(
+                contract_data_keys(&env),
+                keys_before,
+                "save at ts {ts} wrote a new key"
+            );
+        }
+    }
+
+    #[test]
+    fn full_history_is_capped_fits_one_entry_and_stays_within_budget() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+        env.ledger().set_timestamp(1_000_000);
+        let admin = Address::generate(&env);
+        let (pool, consumer) = setup_pool_and_consumer(&env, &admin, 1_000_000, 1_000_000);
+
+        let cap = TwapConsumer::MAX_SNAPSHOTS_PER_POOL;
+        let saves = cap + 40;
+        // One save a minute: well inside the default 7-day age limit, so only
+        // the hard count cap prunes.
+        for i in 1..saves {
+            env.ledger().set_timestamp(1_000_000 + 60 * i as u64);
+            consumer.save_snapshot(&pool);
+        }
+        assert_eq!(consumer.get_snapshot_count(&pool), cap);
+        let stamps = consumer.list_snapshot_timestamps(&pool, &0, &1);
+        assert_eq!(
+            stamps.get(0).unwrap(),
+            1_000_000 + 60 * (saves - cap) as u64
+        );
+
+        // The whole history is one ledger entry; keep it well under the
+        // 64 KiB entry size limit.
+        let encoded = env.as_contract(&consumer.address, || {
+            let snapshots: Vec<SnapshotEntry> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Snapshots(pool.clone()))
+                .unwrap();
+            use soroban_sdk::xdr::ToXdr;
+            snapshots.to_xdr(&env).len()
+        });
+        assert!(
+            encoded < 48 * 1024,
+            "full history encodes to {encoded} bytes"
+        );
+
+        // A save against a full history fits the default (network-sized)
+        // resource budget.
+        env.budget().reset_default();
+        env.ledger().set_timestamp(1_000_000 + 60 * saves as u64);
+        consumer.save_snapshot(&pool);
+        assert_eq!(consumer.get_snapshot_count(&pool), cap);
+    }
+
+    #[test]
+    fn retention_count_above_hard_cap_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let consumer = TwapConsumerClient::new(&env, &env.register_contract(None, TwapConsumer));
+        consumer.initialize(&admin);
+        let too_many = RetentionPolicy {
+            max_age_seconds: 0,
+            max_snapshots_per_pool: TwapConsumer::MAX_SNAPSHOTS_PER_POOL + 1,
+        };
+        assert_eq!(
+            consumer.try_set_retention_policy(&admin, &too_many),
+            Err(Ok(TwapError::InvalidRetentionPolicy))
+        );
+        let at_cap = RetentionPolicy {
+            max_age_seconds: 0,
+            max_snapshots_per_pool: TwapConsumer::MAX_SNAPSHOTS_PER_POOL,
+        };
+        consumer.set_retention_policy(&admin, &at_cap);
+    }
+
+    #[test]
+    fn same_ledger_resave_replaces_and_delete_follows_the_single_entry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let admin = Address::generate(&env);
+        let (pool, consumer) = setup_pool_and_consumer(&env, &admin, 1_000_000, 1_000_000);
+        consumer.save_snapshot(&pool);
+        assert_eq!(consumer.get_snapshot_count(&pool), 1);
+
+        env.ledger().set_timestamp(10_100);
+        consumer.save_snapshot(&pool);
+        assert_eq!(consumer.get_snapshot_count(&pool), 2);
+
+        consumer.delete_snapshot(&pool, &10_000);
+        let stamps = consumer.list_snapshot_timestamps(&pool, &0, &10);
+        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps.get(0).unwrap(), 10_100);
+        assert_eq!(
+            consumer.try_delete_snapshot(&pool, &10_000),
+            Err(Ok(TwapError::NoSnapshotFound))
+        );
+    }
+
+    // ── Issue #910: instance storage TTL is never extended ──────────────────
+    //
+    // `twap_consumer` used to extend only its persistent snapshot entries,
+    // never the instance entry holding the keeper address and retention
+    // policy. A low-traffic oracle consumer that goes unread for long
+    // enough would let that instance entry's TTL lapse and get archived,
+    // trapping every subsequent call until someone restores it. These tests
+    // pin `extend_instance_ttl` in place on the read and write entrypoints.
+
+    fn instance_ttl(env: &Env, consumer: &TwapConsumerClient<'_>) -> u32 {
+        env.as_contract(&consumer.address, || env.storage().instance().get_ttl())
+    }
+
+    /// Advances the ledger sequence number far enough that the instance
+    /// entry's remaining TTL drops below `INSTANCE_TTL_THRESHOLD`, simulating
+    /// a long quiet stretch between calls to a sparsely-read oracle consumer.
+    fn lower_instance_ttl_below_threshold(env: &Env, consumer: &TwapConsumerClient<'_>) {
+        env.ledger().with_mut(|l| {
+            l.sequence_number +=
+                TwapConsumer::INSTANCE_TTL_BUMP_TO - TwapConsumer::INSTANCE_TTL_THRESHOLD + 1
+        });
+        let ttl = instance_ttl(env, consumer);
+        assert!(
+            ttl < TwapConsumer::INSTANCE_TTL_THRESHOLD,
+            "test setup should lower instance TTL below the threshold, got {ttl}"
+        );
+    }
+
+    fn assert_instance_ttl_bumped(env: &Env, consumer: &TwapConsumerClient<'_>) {
+        let ttl = instance_ttl(env, consumer);
+        assert!(
+            ttl >= TwapConsumer::INSTANCE_TTL_BUMP_TO - 1,
+            "instance TTL {ttl} should be bumped toward INSTANCE_TTL_BUMP_TO"
+        );
+    }
+
+    #[test]
+    fn test_initialize_extends_instance_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+
+        consumer.initialize(&admin);
+
+        assert_instance_ttl_bumped(&env, &consumer);
+    }
+
+    /// A read-only entrypoint (`get_keeper`) still restores a lapsed
+    /// instance TTL — this is the failure mode the issue calls out: a
+    /// read-only path is often the only traffic this contract sees for long
+    /// stretches, so it must extend the TTL too, not just the writes.
+    #[test]
+    fn test_get_keeper_restores_lapsed_instance_ttl_and_still_responds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+
+        lower_instance_ttl_below_threshold(&env, &consumer);
+
+        // The call must still succeed rather than trap on an archived
+        // instance entry, and it must restore the TTL for the next caller.
+        let keeper = consumer.get_keeper();
+        assert_eq!(keeper, admin);
+        assert_instance_ttl_bumped(&env, &consumer);
+    }
+
+    /// A state-mutating entrypoint (`set_retention_policy`) restores a
+    /// lapsed instance TTL as its first statement, before the keeper check
+    /// even runs.
+    #[test]
+    fn test_set_retention_policy_restores_lapsed_instance_ttl_and_still_responds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+
+        lower_instance_ttl_below_threshold(&env, &consumer);
+
+        // Must still succeed rather than trap on an archived instance entry.
+        consumer.set_retention_policy(
+            &admin,
+            &RetentionPolicy {
+                max_age_seconds: TwapConsumer::LONGEST_TWAP_WINDOW,
+                max_snapshots_per_pool: 100,
+            },
+        );
+
+        assert_instance_ttl_bumped(&env, &consumer);
+        assert_eq!(consumer.get_retention_policy().max_snapshots_per_pool, 100);
     }
 
     // ── #964: typed tracked pools ────────────────────────────────────────────
@@ -2410,101 +2556,5 @@ mod tests {
         assert_eq!(typed.len(), 2);
         assert_eq!(typed.get(0).unwrap().pool_type, PoolType::Amm);
         assert_eq!(typed.get(1).unwrap().pool_type, PoolType::Cl);
-    // ── Issue #910: instance storage TTL is never extended ──────────────────
-    //
-    // `twap_consumer` used to extend only its persistent snapshot entries,
-    // never the instance entry holding the keeper address and retention
-    // policy. A low-traffic oracle consumer that goes unread for long
-    // enough would let that instance entry's TTL lapse and get archived,
-    // trapping every subsequent call until someone restores it. These tests
-    // pin `extend_instance_ttl` in place on the read and write entrypoints.
-
-    fn instance_ttl(env: &Env, consumer: &TwapConsumerClient<'_>) -> u32 {
-        env.as_contract(&consumer.address, || env.storage().instance().get_ttl())
-    }
-
-    /// Advances the ledger sequence number far enough that the instance
-    /// entry's remaining TTL drops below `INSTANCE_TTL_THRESHOLD`, simulating
-    /// a long quiet stretch between calls to a sparsely-read oracle consumer.
-    fn lower_instance_ttl_below_threshold(env: &Env, consumer: &TwapConsumerClient<'_>) {
-        env.ledger().with_mut(|l| {
-            l.sequence_number +=
-                TwapConsumer::INSTANCE_TTL_BUMP_TO - TwapConsumer::INSTANCE_TTL_THRESHOLD + 1
-        });
-        let ttl = instance_ttl(env, consumer);
-        assert!(
-            ttl < TwapConsumer::INSTANCE_TTL_THRESHOLD,
-            "test setup should lower instance TTL below the threshold, got {ttl}"
-        );
-    }
-
-    fn assert_instance_ttl_bumped(env: &Env, consumer: &TwapConsumerClient<'_>) {
-        let ttl = instance_ttl(env, consumer);
-        assert!(
-            ttl >= TwapConsumer::INSTANCE_TTL_BUMP_TO - 1,
-            "instance TTL {ttl} should be bumped toward INSTANCE_TTL_BUMP_TO"
-        );
-    }
-
-    #[test]
-    fn test_initialize_extends_instance_ttl() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let consumer_addr = env.register_contract(None, TwapConsumer);
-        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
-
-        consumer.initialize(&admin);
-
-        assert_instance_ttl_bumped(&env, &consumer);
-    }
-
-    /// A read-only entrypoint (`get_keeper`) still restores a lapsed
-    /// instance TTL — this is the failure mode the issue calls out: a
-    /// read-only path is often the only traffic this contract sees for long
-    /// stretches, so it must extend the TTL too, not just the writes.
-    #[test]
-    fn test_get_keeper_restores_lapsed_instance_ttl_and_still_responds() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let consumer_addr = env.register_contract(None, TwapConsumer);
-        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
-        consumer.initialize(&admin);
-
-        lower_instance_ttl_below_threshold(&env, &consumer);
-
-        // The call must still succeed rather than trap on an archived
-        // instance entry, and it must restore the TTL for the next caller.
-        let keeper = consumer.get_keeper();
-        assert_eq!(keeper, admin);
-        assert_instance_ttl_bumped(&env, &consumer);
-    }
-
-    /// A state-mutating entrypoint (`set_retention_policy`) restores a
-    /// lapsed instance TTL as its first statement, before the keeper check
-    /// even runs.
-    #[test]
-    fn test_set_retention_policy_restores_lapsed_instance_ttl_and_still_responds() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let consumer_addr = env.register_contract(None, TwapConsumer);
-        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
-        consumer.initialize(&admin);
-
-        lower_instance_ttl_below_threshold(&env, &consumer);
-
-        // Must still succeed rather than trap on an archived instance entry.
-        consumer.set_retention_policy(
-            &admin,
-            &RetentionPolicy {
-                max_age_seconds: TwapConsumer::LONGEST_TWAP_WINDOW,
-                max_snapshots_per_pool: 100,
-            },
-        );
-
-        assert_instance_ttl_bumped(&env, &consumer);
-        assert_eq!(consumer.get_retention_policy().max_snapshots_per_pool, 100);
     }
 }

@@ -63,6 +63,8 @@ jobs:
               run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --exclude amm_fuzz
             - name: Check error docs sync
               run: make check-docs
+            - name: Check storage keys do not depend on the ledger clock
+              run: make check-storage-keys
             # Every deployable workspace contract must have a scripts/deploy/
             # module that scripts/deploy.sh actually runs (issue #959).
             - name: Check deploy scripts cover every contract
