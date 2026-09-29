@@ -306,11 +306,7 @@ impl TwapConsumer {
             .ok_or(TwapError::NoSnapshotFound)?;
         snapshots.remove(index as u32);
         Self::store_snapshots(&env, &pool, &snapshots);
-        soroban_amm_sdk::emit_versioned_event!(
-            &env,
-            (symbol_short!("snap_del"), pool),
-            ledger_ts
-        );
+        soroban_amm_sdk::emit_versioned_event!(&env, (symbol_short!("snap_del"), pool), ledger_ts);
         Ok(())
     }
 

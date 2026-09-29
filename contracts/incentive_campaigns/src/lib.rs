@@ -2356,8 +2356,7 @@ mod tests {
         use soroban_sdk::testutils::Events as _;
         use soroban_sdk::IntoVal;
 
-        let wanted: soroban_sdk::Vec<soroban_sdk::Val> =
-            (Symbol::new(env, topic),).into_val(env);
+        let wanted: soroban_sdk::Vec<soroban_sdk::Val> = (Symbol::new(env, topic),).into_val(env);
         let evt = env
             .events()
             .all()
@@ -2403,9 +2402,8 @@ mod tests {
         let (env, incentives, pool, lp, reward, _provider, gov) = setup();
         let client = IncentiveCampaignsClient::new(&env, &incentives);
 
-        let id = client.create_campaign(
-            &gov, &pool, &lp, &reward, &1_000, &11_000, &100, &1_000_000,
-        );
+        let id =
+            client.create_campaign(&gov, &pool, &lp, &reward, &1_000, &11_000, &100, &1_000_000);
 
         let (version, data): (u32, (u64, Address, Address, u64, u64, i128)) =
             last_versioned_event(&env, &incentives, "campaign_created");
@@ -2419,9 +2417,8 @@ mod tests {
         let (env, incentives, pool, lp, reward, _provider, gov) = setup();
         let client = IncentiveCampaignsClient::new(&env, &incentives);
 
-        let id = client.create_campaign(
-            &gov, &pool, &lp, &reward, &1_000, &20_000, &100, &2_000_000,
-        );
+        let id =
+            client.create_campaign(&gov, &pool, &lp, &reward, &1_000, &20_000, &100, &2_000_000);
         client.set_campaign_rate(&gov, &id, &200);
 
         let (version, data): (u32, (u64, i128)) =
@@ -2438,9 +2435,8 @@ mod tests {
         let treasury = Address::generate(&env);
 
         // Campaign runs 1_000..5_000 at rate 100, funded 1_000_000; no claims.
-        let id = client.create_campaign(
-            &gov, &pool, &lp, &reward, &1_000, &5_000, &100, &1_000_000,
-        );
+        let id =
+            client.create_campaign(&gov, &pool, &lp, &reward, &1_000, &5_000, &100, &1_000_000);
         env.ledger().with_mut(|l| l.timestamp = 9_000);
         let recovered = client.recover_leftover_funds(&gov, &id, &treasury);
 
@@ -2456,9 +2452,8 @@ mod tests {
         let (env, incentives, pool, lp, reward, provider, gov) = setup();
         let client = IncentiveCampaignsClient::new(&env, &incentives);
 
-        let id = client.create_campaign(
-            &gov, &pool, &lp, &reward, &1_000, &11_000, &100, &1_000_000,
-        );
+        let id =
+            client.create_campaign(&gov, &pool, &lp, &reward, &1_000, &11_000, &100, &1_000_000);
         // First claim initialises the snapshot and emits nothing.
         assert_eq!(client.claim_rewards(&provider, &id), 0);
         // Advance and claim again: this distribution is the first audit record.

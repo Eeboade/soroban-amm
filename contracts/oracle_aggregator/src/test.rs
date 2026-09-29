@@ -952,8 +952,6 @@ fn instance_ttl_is_extended_on_access_across_ledger_advance() {
     }
 }
 
-
-
 #[test]
 fn test_admin_rotation_happy_path() {
     let env = Env::default();

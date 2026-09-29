@@ -324,11 +324,7 @@ impl TwalConsumer {
             pool_type,
         });
         Self::store_tracked(env, &tracked);
-        soroban_amm_sdk::emit_versioned_event!(
-            env,
-            (Symbol::new(env, "pool_add"),),
-            pool.clone()
-        );
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(env, "pool_add"),), pool.clone());
         Ok(())
     }
 
@@ -350,11 +346,7 @@ impl TwalConsumer {
         let idx = Self::first_tracked_index(&tracked, &pool).ok_or(TwalError::NotTracked)?;
         tracked.remove(idx);
         Self::store_tracked(&env, &tracked);
-        soroban_amm_sdk::emit_versioned_event!(
-            &env,
-            (Symbol::new(&env, "pool_remove"),),
-            pool
-        );
+        soroban_amm_sdk::emit_versioned_event!(&env, (Symbol::new(&env, "pool_remove"),), pool);
         Ok(())
     }
 
@@ -1846,8 +1838,7 @@ mod tests {
         use soroban_sdk::testutils::Events as _;
         use soroban_sdk::IntoVal;
 
-        let wanted: soroban_sdk::Vec<soroban_sdk::Val> =
-            (Symbol::new(env, topic),).into_val(env);
+        let wanted: soroban_sdk::Vec<soroban_sdk::Val> = (Symbol::new(env, topic),).into_val(env);
         let evt = env
             .events()
             .all()

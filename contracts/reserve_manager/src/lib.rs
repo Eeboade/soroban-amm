@@ -1507,7 +1507,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_pause_and_unpause_requires_auth() {
         let s = setup();

@@ -1001,8 +1001,7 @@ mod tests {
         let client = PolVestingContractClient::new(&s.env, &s.contract_id);
         client.release(&s.beneficiary, &schedule_id);
 
-        let (version, data): (u32, (Address, u32, i128)) =
-            last_versioned_event(&s, "released");
+        let (version, data): (u32, (Address, u32, i128)) = last_versioned_event(&s, "released");
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(version, 1);
         assert_eq!(data, (s.beneficiary.clone(), schedule_id, 500_000));

@@ -17,11 +17,11 @@
 
 #![no_std]
 
+use pool_interfaces::ClPoolClient;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token as sdk_token,
     Address, BytesN, Env, Symbol, Vec,
 };
-use pool_interfaces::ClPoolClient;
 
 // ── Typed errors ─────────────────────────────────────────────────────────────
 
@@ -46,8 +46,6 @@ pub enum FactoryError {
     /// `InvalidFeeBps`, so this is appended rather than renumbered.
     NotInitialized = 12,
 }
-
-
 
 #[contractclient(name = "AmmPoolClient")]
 pub trait AmmPoolInterface {
