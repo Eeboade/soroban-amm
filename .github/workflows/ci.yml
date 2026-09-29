@@ -57,7 +57,7 @@ jobs:
                   mkdir -p target/wasm32v1-none/release/optimized
                   while IFS= read -r wasm; do
                       name=$(basename "$wasm")
-                      stellar contract optimize --wasm "$wasm" --output "target/wasm32v1-none/release/optimized/$name"
+                      stellar contract optimize --wasm "$wasm" --wasm-out "target/wasm32v1-none/release/optimized/$name"
                   done < <(find target/wasm32v1-none/release -maxdepth 1 -name '*.wasm' -type f | sort)
             - name: Check WASM binary sizes (network cap, optimized)
               run: bash scripts/size_report.sh --fail-on-limit --optimized

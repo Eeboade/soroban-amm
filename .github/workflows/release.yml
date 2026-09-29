@@ -48,7 +48,7 @@ jobs:
           mkdir -p release-artifacts
           while IFS= read -r wasm; do
             name=$(basename "$wasm")
-            stellar contract optimize --wasm "$wasm" --output "release-artifacts/$name"
+            stellar contract optimize --wasm "$wasm" --wasm-out "release-artifacts/$name"
           done < <(find target/wasm32v1-none/release -maxdepth 1 -name '*.wasm' -type f | sort)
       - name: Check contract sizes (optimized, network cap)
         run: WASM_DIR=release-artifacts bash scripts/size_report.sh --fail-on-limit

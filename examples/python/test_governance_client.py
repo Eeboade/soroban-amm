@@ -21,7 +21,6 @@ import governance_client
 import twap_client
 from common import decode_enum_variant
 
-
 # ---------------------------------------------------------------------------
 # decode_enum_variant — unit tests for all shapes scval.to_native returns
 # ---------------------------------------------------------------------------
