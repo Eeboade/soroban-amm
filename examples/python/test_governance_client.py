@@ -74,7 +74,7 @@ def test_proposal_status_returns_variant_name_for_bare_string() -> None:
 
 def _mock_governance_env(monkeypatch: pytest.MonkeyPatch, status_raw: object) -> None:
     monkeypatch.setenv("GOV_CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
-    monkeypatch.setenv("SOURCE_SECRET", "SCZANGBA5YELMOUBOU65TXGT5ZYCNFGDL3IQPKNM5DCXMQXMFMK5K7W")
+    monkeypatch.setenv("SOURCE_SECRET", "SBNLZRY4QRPLBZJY5F47NBTJLYSHVKEC3TGVD3LBVH46DZYUL2VLBSBT")
     monkeypatch.setattr(governance_client, "simulate_contract_call", Mock(return_value=status_raw))
     monkeypatch.setattr(governance_client, "submit_contract_call", Mock(return_value=0))
     # Patch ContractClient so no real network connection is made
@@ -137,7 +137,7 @@ def test_vote_failure_returns_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_factory_create_pool_failure_returns_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FACTORY_CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
-    monkeypatch.setenv("SOURCE_SECRET", "SCZANGBA5YELMOUBOU65TXGT5ZYCNFGDL3IQPKNM5DCXMQXMFMK5K7W")
+    monkeypatch.setenv("SOURCE_SECRET", "SBNLZRY4QRPLBZJY5F47NBTJLYSHVKEC3TGVD3LBVH46DZYUL2VLBSBT")
     monkeypatch.setenv("TOKEN_A_CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
     monkeypatch.setenv("TOKEN_B_CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
 
@@ -160,7 +160,7 @@ def test_factory_create_pool_failure_returns_nonzero(monkeypatch: pytest.MonkeyP
 def _base_twap_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TWAP_CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
     monkeypatch.setenv("POOL_CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
-    monkeypatch.setenv("SOURCE_SECRET", "SCZANGBA5YELMOUBOU65TXGT5ZYCNFGDL3IQPKNM5DCXMQXMFMK5K7W")
+    monkeypatch.setenv("SOURCE_SECRET", "SBNLZRY4QRPLBZJY5F47NBTJLYSHVKEC3TGVD3LBVH46DZYUL2VLBSBT")
     mock_client = MagicMock()
     monkeypatch.setattr(twap_client, "ContractClient", Mock(return_value=mock_client))
 
