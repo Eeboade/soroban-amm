@@ -106,6 +106,15 @@ jobs:
         shell: bash
         run: bash scripts/e2e/preflight.sh
 
+      # Builds then optimizes every contract into optimized-artifacts/, which
+      # scripts/deploy/common.sh's wasm_path() prefers over the raw release
+      # build. Some contracts (e.g. concentrated_liquidity) exceed the
+      # 128KB network cap unoptimized, so deploying without this step fails
+      # size_check — see release.yml, which enforces the same optimized cap.
+      - name: Build & optimize contracts
+        shell: bash
+        run: bash scripts/optimize_contracts.sh
+
       - name: Run e2e script
         id: e2e
         shell: bash
